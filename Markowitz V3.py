@@ -16,6 +16,8 @@ NUM_PORTFOLIOS = 1_000_000
 RISK_FREE_RATE = 0.15
 MIN_WEIGHT = 0
 MAX_WEIGHT = 1
+USE_EWMA    = True   # True = covariância EWMA (RiskMetrics); False = covariância histórica simples
+EWMA_LAMBDA = 0.94   # Padrão RiskMetrics — meia-vida ~11 dias
 
 # --- Download dos dados ---
 pf_data = yf.download(MINHA_CARTEIRA, period="10y")['Close']
@@ -32,7 +34,21 @@ pf_data = pf_data.dropna()
 # --- Cálculo de retorno e risco ---
 retorno_log = np.log(pf_data / pf_data.shift(1)).dropna()
 retorno_anualizado = retorno_log.mean() * 252
-cov_carteira = retorno_log.cov() * 252
+
+def calc_ewma_cov(ret: pd.DataFrame, lam: float) -> pd.DataFrame:
+    """Covariância EWMA (RiskMetrics): Σ_t = λ·Σ_{t-1} + (1-λ)·r_{t-1}·r_{t-1}ᵀ"""
+    cov = ret.iloc[:30].cov().values          # inicializa com os primeiros 30 dias
+    for i in range(30, len(ret)):
+        r = ret.iloc[i].values
+        cov = lam * cov + (1 - lam) * np.outer(r, r)
+    return pd.DataFrame(cov * 252, index=ret.columns, columns=ret.columns)
+
+if USE_EWMA:
+    cov_carteira = calc_ewma_cov(retorno_log, EWMA_LAMBDA)
+    print(f"Usando covariância EWMA (λ={EWMA_LAMBDA})")
+else:
+    cov_carteira = retorno_log.cov() * 252
+    print("Usando covariância histórica simples")
 
 num_ativos = len(MINHA_CARTEIRA)
 min_weights = np.full(num_ativos, MIN_WEIGHT)
