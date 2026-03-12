@@ -1,96 +1,131 @@
-# Este código retorna a carteira de ações com maior retorno, menor volatilidade e maior Sharpe Ratio dado um conjunto de ativos, com restrições de peso mínimo e máximo para cada ativo.
+# Este código retorna a carteira de ações com maior retorno, menor volatilidade e maior Sharpe Ratio
+# dado um conjunto de ativos, com restrições de peso mínimo e máximo para cada ativo.
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
+from scipy.stats import norm
 
-# Definindo minha carteira de ações
-MinhaCarteira = [
+# --- Parâmetros ---
+MINHA_CARTEIRA = [
     "CVCB3.SA", "SAPR3.SA", "PETR4.SA", "BBAS3.SA",
-    "TAEE11.SA", "CPLE6.SA", "CSMG3.SA", "VALE3.SA", "BRSR6.SA"
+    "TAEE11.SA", "CPLE3.SA", "CSMG3.SA", "VALE3.SA", "BRSR6.SA"
 ]
+NUM_PORTFOLIOS = 1_000_000
+RISK_FREE_RATE = 0.15
+MIN_WEIGHT = 0
+MAX_WEIGHT = 1
 
-# Baixando os dados de fechamento ajustado
-pf_data = yf.download(MinhaCarteira, period="10y")['Close']
+# --- Download dos dados ---
+pf_data = yf.download(MINHA_CARTEIRA, period="10y")['Close']
 
-# Calculo do Retorno e Risco da Carteira
-retorno_log = np.log(pf_data / pf_data.shift(1))
+# Verificação pós-download
+missing = [t for t in MINHA_CARTEIRA if t not in pf_data.columns]
+if missing:
+    print(f"Aviso: tickers não encontrados e removidos: {missing}")
+    MINHA_CARTEIRA = [t for t in MINHA_CARTEIRA if t not in missing]
+    pf_data = pf_data[MINHA_CARTEIRA]
+
+pf_data = pf_data.dropna()
+
+# --- Cálculo de retorno e risco ---
+retorno_log = np.log(pf_data / pf_data.shift(1)).dropna()
 retorno_anualizado = retorno_log.mean() * 252
-risco_carteira = retorno_log.std() * np.sqrt(252)
 cov_carteira = retorno_log.cov() * 252
 
-num_ativos = len(MinhaCarteira)
-num_portfolios = 1000000
+num_ativos = len(MINHA_CARTEIRA)
+min_weights = np.full(num_ativos, MIN_WEIGHT)
+max_weights = np.full(num_ativos, MAX_WEIGHT)
 
-# Defina os limites mínimos e máximos para cada ativo (na mesma ordem da carteira)
-min_weights = np.array([0.05] * num_ativos)  # Exemplo: mínimo de 5% para cada ativo
-max_weights = np.array([0.20] * num_ativos)  # Exemplo: máximo de 20% para cada ativo
-
-# Função para gerar pesos respeitando os limites
+# --- Geração vetorizada de pesos ---
 def generate_limited_weights(num_portfolios, num_ativos, min_w, max_w):
-    weights_list = []
-    for _ in range(num_portfolios):
-        # Start with minimum weights
-        w = min_w.copy()
-        # Distribute the remaining weight randomly
-        remaining = 1.0 - w.sum()
-        # If remaining is negative, constraints are impossible
-        if remaining < 0:
-            raise ValueError("Sum of min_weights is greater than 1. Adjust your constraints.")
-        # Calculate the maximum additional weight for each asset
-        max_additional = max_w - min_w
-        # Generate random proportions for the remaining weight
-        rand = np.random.dirichlet(np.ones(num_ativos))
-        # Scale random proportions to fit the remaining weight and max_additional
-        additional = np.minimum(rand * remaining, max_additional)
-        # If sum(additional) < remaining, distribute the leftover to assets that can still take more
-        leftover = remaining - additional.sum()
-        if leftover > 1e-8:
-            for i in np.argsort(max_additional - additional)[::-1]:
-                add = min(leftover, max_additional[i] - additional[i])
-                additional[i] += add
-                leftover -= add
-                if leftover <= 1e-8:
-                    break
-        w += additional
-        weights_list.append(w)
-    return np.array(weights_list)
+    remaining = 1.0 - min_w.sum()
+    if remaining < 0:
+        raise ValueError("Soma dos pesos mínimos é maior que 1. Ajuste as restrições.")
+    max_additional = max_w - min_w
 
-# Simulação dos portfólios com restrições de peso
-weights = generate_limited_weights(num_portfolios, num_ativos, min_weights, max_weights)
-returns = np.dot(weights, retorno_anualizado)
-volatility = np.sqrt(np.einsum('ij,jk,ik->i', weights, cov_carteira, weights))
-risk_free_rate = 0.15
-sharpe = (returns - risk_free_rate) / volatility
+    additional = np.random.dirichlet(np.ones(num_ativos), size=num_portfolios) * remaining
 
-# Criando DataFrame dos portfólios
-portfolios = pd.DataFrame({
-    'Returns': returns,
-    'Volatility': volatility,
-    'Sharpe': sharpe
-})
-portfolios['Weights'] = list(weights)
+    # Clipping iterativo para respeitar os limites (converge rapidamente)
+    for _ in range(10):
+        additional = np.clip(additional, 0, max_additional)
+        row_sums = additional.sum(axis=1, keepdims=True)
+        additional = additional * (remaining / row_sums)
 
-# Plot
-portfolios.plot(x='Volatility', y='Returns', kind='scatter', figsize=(10, 6), grid=True)
-plt.title('Portfolio Returns vs Volatility')
-plt.xlabel('Volatility')
-plt.ylabel('Returns')
+    additional = np.clip(additional, 0, max_additional)
+    return min_w + additional
+
+# --- Simulação ---
+weights = generate_limited_weights(NUM_PORTFOLIOS, num_ativos, min_weights, max_weights)
+returns = weights @ retorno_anualizado.values
+volatility = np.sqrt(np.einsum('ij,jk,ik->i', weights, cov_carteira.values, weights))
+sharpe = (returns - RISK_FREE_RATE) / volatility
+
+# CVaR paramétrico (diário, 95%) — usado para encontrar o portfólio de menor CVaR
+z = norm.ppf(0.05)
+daily_mean = returns / 252
+daily_std = volatility / np.sqrt(252)
+cvar_param = -(daily_mean - daily_std * norm.pdf(z) / 0.05)
+
+# --- DataFrame com pesos em colunas individuais ---
+portfolios = pd.DataFrame({'Returns': returns, 'Volatility': volatility, 'Sharpe': sharpe, 'CVaR_param': cvar_param})
+for i, ticker in enumerate(MINHA_CARTEIRA):
+    portfolios[ticker] = weights[:, i]
+
+# --- Portfólios ótimos ---
+max_return_idx = portfolios['Returns'].idxmax()
+min_vol_idx    = portfolios['Volatility'].idxmin()
+max_sharpe_idx = portfolios['Sharpe'].idxmax()
+min_cvar_idx   = portfolios['CVaR_param'].idxmin()
+
+# --- VaR e CVaR histórico (diário, 95%) para os portfólios ótimos ---
+def calc_var_cvar_hist(w: np.ndarray, retorno_log: pd.DataFrame, confidence: float = 0.95):
+    port_returns = retorno_log.values @ w
+    var  = -np.percentile(port_returns, (1 - confidence) * 100)
+    cvar = -port_returns[port_returns <= -var].mean()
+    return var, cvar
+
+# --- Plot com destaques ---
+fig, ax = plt.subplots(figsize=(10, 6))
+portfolios.plot(
+    x='Volatility', y='Returns', kind='scatter', ax=ax,
+    c='Sharpe', cmap='viridis', alpha=0.3, s=1, grid=True
+)
+
+otimos = {
+    'Maior Retorno':       (max_return_idx, 'red',    '^'),
+    'Menor Volatilidade':  (min_vol_idx,    'blue',   'o'),
+    'Maior Sharpe Ratio':  (max_sharpe_idx, 'green',  '*'),
+    'Menor CVaR':          (min_cvar_idx,   'orange', 'D'),
+}
+for label, (idx, color, marker) in otimos.items():
+    p = portfolios.loc[idx]
+    ax.scatter(p['Volatility'], p['Returns'], c=color, marker=marker, s=200, zorder=5, label=label)
+
+ax.set_title('Fronteira Eficiente — Markowitz')
+ax.set_xlabel('Volatilidade')
+ax.set_ylabel('Retorno')
+ax.legend()
+plt.tight_layout()
 plt.show()
 
-# Encontrando os portfólios ótimos
-max_return_idx = portfolios['Returns'].idxmax()
-min_volatility_idx = portfolios['Volatility'].idxmin()
-max_sharpe_idx = portfolios['Sharpe'].idxmax()
-
-def print_portfolio_info(title, portfolio, assets):
+# --- Resultados ---
+def print_portfolio_info(title, portfolio, assets, w: np.ndarray, retorno_log: pd.DataFrame):
+    var_hist, cvar_hist = calc_var_cvar_hist(w, retorno_log)
     print(f"\n{title}:")
-    print(portfolio.drop('Weights'))
+    print(portfolio[['Returns', 'Volatility', 'Sharpe']])
+    print(f"  VaR histórico  (95%, diário): {var_hist:.4f} ({var_hist*100:.2f}%)")
+    print(f"  CVaR histórico (95%, diário): {cvar_hist:.4f} ({cvar_hist*100:.2f}%)")
     print("Composição:")
-    for asset, weight in zip(assets, portfolio['Weights']):
-        print(f"  {asset}: {weight:.4f}")
+    for asset in assets:
+        print(f"  {asset}: {portfolio[asset]:.4f}")
 
-print_portfolio_info("Portfolio com maior retorno", portfolios.loc[max_return_idx], MinhaCarteira)
-print_portfolio_info("Portfolio com menor volatilidade", portfolios.loc[min_volatility_idx], MinhaCarteira)
-print_portfolio_info("Portfolio com maior Sharpe Ratio", portfolios.loc[max_sharpe_idx], MinhaCarteira)
+for title, idx in [
+    ("Portfolio com maior retorno",       max_return_idx),
+    ("Portfolio com menor volatilidade",  min_vol_idx),
+    ("Portfolio com maior Sharpe Ratio",  max_sharpe_idx),
+    ("Portfolio com menor CVaR",          min_cvar_idx),
+]:
+    w = portfolios.loc[idx, MINHA_CARTEIRA].values
+    print_portfolio_info(title, portfolios.loc[idx], MINHA_CARTEIRA, w, retorno_log)
