@@ -6,6 +6,7 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+from scipy.optimize import minimize
 
 # --- Parâmetros ---
 MINHA_CARTEIRA = [
@@ -20,7 +21,7 @@ USE_EWMA    = True   # True = covariância EWMA (RiskMetrics); False = covariân
 EWMA_LAMBDA = 0.94   # Padrão RiskMetrics — meia-vida ~11 dias
 
 # --- Download dos dados ---
-pf_data = yf.download(MINHA_CARTEIRA, period="10y")['Close']
+pf_data = yf.download(MINHA_CARTEIRA, period="10y", auto_adjust=True)['Close']
 
 # Verificação pós-download
 missing = [t for t in MINHA_CARTEIRA if t not in pf_data.columns]
@@ -125,6 +126,51 @@ def calc_max_drawdown(w: np.ndarray, retorno_log: pd.DataFrame) -> float:
     drawdowns = (cumulative - running_max) / running_max
     return drawdowns.min()                             # pior queda (número negativo)
 
+# --- Benchmark: IBOV ---
+ibov_raw = yf.download("^BVSP", period="10y", auto_adjust=True, progress=False)['Close']
+ibov_ret  = np.log(ibov_raw / ibov_raw.shift(1)).dropna()
+ibov_ret  = ibov_ret.reindex(retorno_log.index).dropna()   # alinha às mesmas datas
+
+ibov_return   = float(ibov_ret.mean().iloc[0] * 252)
+ibov_vol      = float(ibov_ret.std().iloc[0] * np.sqrt(252))
+ibov_sharpe   = (ibov_return - RISK_FREE_RATE) / ibov_vol
+ibov_sortino_dd = float(np.sqrt(np.mean(np.minimum(ibov_ret.values, 0) ** 2)) * np.sqrt(252))
+ibov_sortino  = (ibov_return - RISK_FREE_RATE) / ibov_sortino_dd
+ibov_var      = float(-np.percentile(ibov_ret.values, 5))
+ibov_cvar     = float(-ibov_ret.values[ibov_ret.values <= -ibov_var].mean())
+ibov_cum      = np.cumprod(1 + ibov_ret.values)
+ibov_maxdd    = float((ibov_cum / np.maximum.accumulate(ibov_cum) - 1).min())
+
+# --- Fronteira eficiente analítica ---
+def efficient_frontier(mu: np.ndarray, cov: np.ndarray, min_w: np.ndarray, max_w: np.ndarray, n_points: int = 60):
+    n = len(mu)
+    bounds = [(min_w[i], max_w[i]) for i in range(n)]
+    w0 = np.ones(n) / n
+    sum_constraint = {'type': 'eq', 'fun': lambda w: w.sum() - 1}
+
+    # Portfólio de mínima variância (ponto mais à esquerda da fronteira)
+    res_mv = minimize(lambda w: w @ cov @ w, w0, method='SLSQP',
+                      bounds=bounds, constraints=[sum_constraint])
+    r_min = float(mu @ res_mv.x)
+    r_max = float(mu.max())
+
+    ef_vols, ef_rets = [], []
+    for r_target in np.linspace(r_min, r_max, n_points):
+        res = minimize(
+            lambda w: w @ cov @ w,
+            w0, method='SLSQP', bounds=bounds,
+            constraints=[sum_constraint,
+                         {'type': 'eq', 'fun': lambda w, r=r_target: w @ mu - r}]
+        )
+        if res.success:
+            ef_vols.append(np.sqrt(res.fun))
+            ef_rets.append(r_target)
+    return ef_vols, ef_rets
+
+ef_vols, ef_rets = efficient_frontier(
+    retorno_anualizado.values, cov_carteira.values, min_weights, max_weights
+)
+
 # --- Plot com destaques ---
 fig, ax = plt.subplots(figsize=(10, 6))
 portfolios.plot(
@@ -142,6 +188,9 @@ otimos = {
 for label, (idx, color, marker) in otimos.items():
     p = portfolios.loc[idx]
     ax.scatter(p['Volatility'], p['Returns'], c=color, marker=marker, s=200, zorder=5, label=label)
+
+ax.plot(ef_vols, ef_rets, 'k--', linewidth=1.5, zorder=4, label='Fronteira Analítica')
+ax.scatter(ibov_vol, ibov_return, c='black', marker='X', s=250, zorder=5, label='IBOV')
 
 ax.set_title('Fronteira Eficiente — Markowitz')
 ax.set_xlabel('Volatilidade')
@@ -172,3 +221,12 @@ for title, idx in [
 ]:
     w = portfolios.loc[idx, MINHA_CARTEIRA].values
     print_portfolio_info(title, portfolios.loc[idx], MINHA_CARTEIRA, w, retorno_log)
+
+print("\nBenchmark — IBOV (^BVSP):")
+print(f"  Retorno anualizado: {ibov_return:.4f} ({ibov_return*100:.2f}%)")
+print(f"  Volatilidade:       {ibov_vol:.4f} ({ibov_vol*100:.2f}%)")
+print(f"  Sharpe:             {ibov_sharpe:.4f}")
+print(f"  Sortino:            {ibov_sortino:.4f}")
+print(f"  VaR  (95%, diário): {ibov_var:.4f} ({ibov_var*100:.2f}%)")
+print(f"  CVaR (95%, diário): {ibov_cvar:.4f} ({ibov_cvar*100:.2f}%)")
+print(f"  Drawdown máximo:    {ibov_maxdd:.4f} ({ibov_maxdd*100:.2f}%)")
