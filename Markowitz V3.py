@@ -111,12 +111,19 @@ max_sharpe_idx  = portfolios['Sharpe'].idxmax()
 max_sortino_idx = portfolios['Sortino'].idxmax()
 min_cvar_idx    = portfolios['CVaR_param'].idxmin()
 
-# --- VaR e CVaR histórico (diário, 95%) para os portfólios ótimos ---
+# --- VaR, CVaR e Drawdown máximo históricos para os portfólios ótimos ---
 def calc_var_cvar_hist(w: np.ndarray, retorno_log: pd.DataFrame, confidence: float = 0.95):
     port_returns = retorno_log.values @ w
     var  = -np.percentile(port_returns, (1 - confidence) * 100)
     cvar = -port_returns[port_returns <= -var].mean()
     return var, cvar
+
+def calc_max_drawdown(w: np.ndarray, retorno_log: pd.DataFrame) -> float:
+    port_returns = retorno_log.values @ w
+    cumulative = np.cumprod(1 + port_returns)          # valor acumulado (base 1)
+    running_max = np.maximum.accumulate(cumulative)    # pico até cada dia
+    drawdowns = (cumulative - running_max) / running_max
+    return drawdowns.min()                             # pior queda (número negativo)
 
 # --- Plot com destaques ---
 fig, ax = plt.subplots(figsize=(10, 6))
@@ -146,10 +153,12 @@ plt.show()
 # --- Resultados ---
 def print_portfolio_info(title, portfolio, assets, w: np.ndarray, retorno_log: pd.DataFrame):
     var_hist, cvar_hist = calc_var_cvar_hist(w, retorno_log)
+    max_dd = calc_max_drawdown(w, retorno_log)
     print(f"\n{title}:")
     print(portfolio[['Returns', 'Volatility', 'Sharpe', 'Sortino']])
     print(f"  VaR histórico  (95%, diário): {var_hist:.4f} ({var_hist*100:.2f}%)")
     print(f"  CVaR histórico (95%, diário): {cvar_hist:.4f} ({cvar_hist*100:.2f}%)")
+    print(f"  Drawdown máximo (histórico):  {max_dd:.4f} ({max_dd*100:.2f}%)")
     print("Composição:")
     for asset in assets:
         print(f"  {asset}: {portfolio[asset]:.4f}")
