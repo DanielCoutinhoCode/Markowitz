@@ -84,16 +84,32 @@ daily_mean = returns / 252
 daily_std = volatility / np.sqrt(252)
 cvar_param = -(daily_mean - daily_std * norm.pdf(z) / 0.05)
 
+# Sortino: penaliza apenas volatilidade negativa (downside deviation)
+# Processado em batches para evitar matriz (T × 1M) em memória
+SORTINO_BATCH = 10_000
+ret_vals = retorno_log.values
+downside_std = np.empty(NUM_PORTFOLIOS)
+total_batches = (NUM_PORTFOLIOS + SORTINO_BATCH - 1) // SORTINO_BATCH
+for i, start in enumerate(range(0, NUM_PORTFOLIOS, SORTINO_BATCH)):
+    end = min(start + SORTINO_BATCH, NUM_PORTFOLIOS)
+    port_ret = ret_vals @ weights[start:end].T        # (T, batch)
+    neg = np.minimum(port_ret, 0)
+    downside_std[start:end] = np.sqrt(np.mean(neg**2, axis=0)) * np.sqrt(252)
+    print(f"\r  Calculando Sortino... {i + 1}/{total_batches} ({(i + 1) / total_batches * 100:.0f}%)", end="", flush=True)
+print()
+sortino = (returns - RISK_FREE_RATE) / downside_std
+
 # --- DataFrame com pesos em colunas individuais ---
-portfolios = pd.DataFrame({'Returns': returns, 'Volatility': volatility, 'Sharpe': sharpe, 'CVaR_param': cvar_param})
+portfolios = pd.DataFrame({'Returns': returns, 'Volatility': volatility, 'Sharpe': sharpe, 'Sortino': sortino, 'CVaR_param': cvar_param})
 for i, ticker in enumerate(MINHA_CARTEIRA):
     portfolios[ticker] = weights[:, i]
 
 # --- Portfólios ótimos ---
-max_return_idx = portfolios['Returns'].idxmax()
-min_vol_idx    = portfolios['Volatility'].idxmin()
-max_sharpe_idx = portfolios['Sharpe'].idxmax()
-min_cvar_idx   = portfolios['CVaR_param'].idxmin()
+max_return_idx  = portfolios['Returns'].idxmax()
+min_vol_idx     = portfolios['Volatility'].idxmin()
+max_sharpe_idx  = portfolios['Sharpe'].idxmax()
+max_sortino_idx = portfolios['Sortino'].idxmax()
+min_cvar_idx    = portfolios['CVaR_param'].idxmin()
 
 # --- VaR e CVaR histórico (diário, 95%) para os portfólios ótimos ---
 def calc_var_cvar_hist(w: np.ndarray, retorno_log: pd.DataFrame, confidence: float = 0.95):
@@ -110,10 +126,11 @@ portfolios.plot(
 )
 
 otimos = {
-    'Maior Retorno':       (max_return_idx, 'red',    '^'),
-    'Menor Volatilidade':  (min_vol_idx,    'blue',   'o'),
-    'Maior Sharpe Ratio':  (max_sharpe_idx, 'green',  '*'),
-    'Menor CVaR':          (min_cvar_idx,   'orange', 'D'),
+    'Maior Retorno':       (max_return_idx,  'red',    '^'),
+    'Menor Volatilidade':  (min_vol_idx,     'blue',   'o'),
+    'Maior Sharpe Ratio':  (max_sharpe_idx,  'green',  '*'),
+    'Maior Sortino':       (max_sortino_idx, 'purple', 'P'),
+    'Menor CVaR':          (min_cvar_idx,    'orange', 'D'),
 }
 for label, (idx, color, marker) in otimos.items():
     p = portfolios.loc[idx]
@@ -130,7 +147,7 @@ plt.show()
 def print_portfolio_info(title, portfolio, assets, w: np.ndarray, retorno_log: pd.DataFrame):
     var_hist, cvar_hist = calc_var_cvar_hist(w, retorno_log)
     print(f"\n{title}:")
-    print(portfolio[['Returns', 'Volatility', 'Sharpe']])
+    print(portfolio[['Returns', 'Volatility', 'Sharpe', 'Sortino']])
     print(f"  VaR histórico  (95%, diário): {var_hist:.4f} ({var_hist*100:.2f}%)")
     print(f"  CVaR histórico (95%, diário): {cvar_hist:.4f} ({cvar_hist*100:.2f}%)")
     print("Composição:")
@@ -141,6 +158,7 @@ for title, idx in [
     ("Portfolio com maior retorno",       max_return_idx),
     ("Portfolio com menor volatilidade",  min_vol_idx),
     ("Portfolio com maior Sharpe Ratio",  max_sharpe_idx),
+    ("Portfolio com maior Sortino",       max_sortino_idx),
     ("Portfolio com menor CVaR",          min_cvar_idx),
 ]:
     w = portfolios.loc[idx, MINHA_CARTEIRA].values
